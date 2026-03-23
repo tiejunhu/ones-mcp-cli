@@ -8,6 +8,8 @@ use std::process::Command;
 use clap::{Args, CommandFactory, Parser, Subcommand, error::ErrorKind};
 use serde::{Deserialize, Serialize};
 
+mod daemon;
+
 #[derive(Parser, Debug)]
 #[command(name = "ones-mcp-cli")]
 #[command(about = "ONES MCP command line interface")]
@@ -24,6 +26,8 @@ struct Cli {
 enum Commands {
     /// Manage CLI configuration
     Config(ConfigCommand),
+    #[command(hide = true)]
+    Daemon(DaemonCommand),
 }
 
 #[derive(Args, Debug)]
@@ -43,6 +47,31 @@ enum ConfigSubcommands {
     Show,
 }
 
+#[derive(Args, Debug)]
+#[command(arg_required_else_help = true)]
+struct DaemonCommand {
+    /// Path to the Unix socket that exposes the daemon bridge
+    #[arg(long)]
+    socket: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: DaemonSubcommands,
+}
+
+#[derive(Subcommand, Debug)]
+enum DaemonSubcommands {
+    Run(DaemonRunCommand),
+    Status,
+    Exit,
+}
+
+#[derive(Args, Debug)]
+struct DaemonRunCommand {
+    /// Run the daemon in the foreground
+    #[arg(long)]
+    foreground: bool,
+}
+
 #[derive(Serialize)]
 struct Config {
     url: String,
@@ -53,14 +82,8 @@ struct StoredConfig {
     url: Option<String>,
 }
 
-fn main() {
-    if should_print_help(env::args_os().len()) {
-        let mut command = Cli::command();
-        command.print_help().expect("failed to print help");
-        println!();
-        process::exit(0);
-    }
-
+#[tokio::main]
+async fn main() {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => match error.kind() {
@@ -75,7 +98,7 @@ fn main() {
         },
     };
 
-    if let Err(error) = run(cli) {
+    if let Err(error) = run(cli).await {
         eprintln!("fatal error: {error}");
         process::exit(1);
     }
@@ -85,20 +108,98 @@ fn should_print_help(arg_count: usize) -> bool {
     arg_count == 1
 }
 
-fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
-    check_runtime_requirements()?;
+async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
+    let arg_count = env::args_os().len();
     let config_path = resolve_config_path(cli.config.clone())?;
 
-    if !matches!(cli.command, Some(Commands::Config(_))) {
+    if command_requires_runtime_checks(cli.command.as_ref()) {
+        check_runtime_requirements()?;
+    }
+
+    if command_requires_config_url(cli.command.as_ref()) {
         ensure_url_configured(&config_path, cli.config.as_deref())?;
+    }
+
+    if command_requires_daemon_ready(cli.command.as_ref()) {
+        daemon::ensure_daemon_running(
+            cli.config.as_deref(),
+            command_socket_override(cli.command.as_ref()),
+        )
+        .await?;
     }
 
     match cli.command {
         Some(Commands::Config(command)) => run_config_command(command, &config_path)?,
-        None => {}
+        Some(Commands::Daemon(command)) => {
+            run_daemon_command(command, &config_path, cli.config.as_deref()).await?;
+        }
+        None => {
+            if should_print_help(arg_count) {
+                let mut command = Cli::command();
+                command.print_help().expect("failed to print help");
+                println!();
+            }
+        }
     }
 
     Ok(())
+}
+
+async fn run_daemon_command(
+    command: DaemonCommand,
+    config_path: &Path,
+    config_override: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
+    match command.command {
+        DaemonSubcommands::Run(run) => {
+            if run.foreground {
+                let url = read_configured_url(config_path)?;
+                daemon::run_daemon(&url, command.socket.as_deref()).await?;
+            } else {
+                let status =
+                    daemon::ensure_daemon_running(config_override, command.socket.as_deref())
+                        .await?;
+                println!("daemon ({status}) is running");
+            }
+        }
+        DaemonSubcommands::Status => {
+            let status = daemon::request_status(command.socket.as_deref()).await?;
+            println!("daemon ({status}) is running");
+        }
+        DaemonSubcommands::Exit => {
+            daemon::request_exit(command.socket.as_deref()).await?;
+            println!("daemon exit");
+        }
+    }
+
+    Ok(())
+}
+
+fn command_requires_runtime_checks(command: Option<&Commands>) -> bool {
+    !matches!(command, Some(Commands::Config(_)) | Some(Commands::Daemon(_)))
+}
+
+fn command_requires_config_url(command: Option<&Commands>) -> bool {
+    match command {
+        None => true,
+        Some(Commands::Config(_)) => false,
+        Some(Commands::Daemon(DaemonCommand {
+            command: DaemonSubcommands::Run(_),
+            ..
+        })) => true,
+        Some(Commands::Daemon(_)) => false,
+    }
+}
+
+fn command_requires_daemon_ready(command: Option<&Commands>) -> bool {
+    !matches!(command, Some(Commands::Config(_)) | Some(Commands::Daemon(_)))
+}
+
+fn command_socket_override(command: Option<&Commands>) -> Option<&Path> {
+    match command {
+        Some(Commands::Daemon(DaemonCommand { socket, .. })) => socket.as_deref(),
+        _ => None,
+    }
 }
 
 fn run_config_command(command: ConfigCommand, config_path: &Path) -> Result<(), Box<dyn Error>> {
@@ -134,6 +235,16 @@ fn ensure_url_configured(
     match config.url {
         Some(url) if !url.trim().is_empty() => Ok(()),
         _ => Err(missing_url_error(config_path, config_override).into()),
+    }
+}
+
+fn read_configured_url(config_path: &Path) -> Result<String, Box<dyn Error>> {
+    let config =
+        read_stored_config(config_path).map_err(|error| -> Box<dyn Error> { error.into() })?;
+
+    match config.url {
+        Some(url) if !url.trim().is_empty() => Ok(url),
+        _ => Err(format!("missing `url` in config file {}", config_path.display()).into()),
     }
 }
 
