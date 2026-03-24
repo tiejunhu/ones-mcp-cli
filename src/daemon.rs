@@ -952,9 +952,10 @@ fn signal_shutdown(shutdown_tx: &watch::Sender<bool>) -> Result<(), Box<dyn Erro
 
 fn spawn_remote(url: &str, npm_cache_dir: &Path) -> Result<Child, Box<dyn Error>> {
     fs::create_dir_all(npm_cache_dir)?;
+    let remote_url = ensure_mcp_url_suffix(url);
 
     let mut command = Command::new("npx");
-    command.arg("-y").arg("mcp-remote").arg(url);
+    command.arg("-y").arg("mcp-remote").arg(&remote_url);
     command.env("npm_config_cache", npm_cache_dir);
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
@@ -962,6 +963,59 @@ fn spawn_remote(url: &str, npm_cache_dir: &Path) -> Result<Child, Box<dyn Error>
     command.kill_on_drop(true);
 
     Ok(command.spawn()?)
+}
+
+fn ensure_mcp_url_suffix(url: &str) -> String {
+    let (url_without_fragment, fragment) = match url.split_once('#') {
+        Some((prefix, suffix)) => (prefix, Some(suffix)),
+        None => (url, None),
+    };
+    let (url_without_query, query) = match url_without_fragment.split_once('?') {
+        Some((prefix, suffix)) => (prefix, Some(suffix)),
+        None => (url_without_fragment, None),
+    };
+    let normalized_base = rewrite_remote_base_url(url_without_query);
+    let normalized_base = normalized_base.trim_end_matches('/');
+
+    let mut normalized = if normalized_base.ends_with("/mcp") {
+        normalized_base.to_owned()
+    } else {
+        format!("{normalized_base}/mcp")
+    };
+
+    if let Some(query) = query {
+        normalized.push('?');
+        normalized.push_str(query);
+    }
+
+    if let Some(fragment) = fragment {
+        normalized.push('#');
+        normalized.push_str(fragment);
+    }
+
+    normalized
+}
+
+fn rewrite_remote_base_url(url: &str) -> String {
+    let Some((scheme, remainder)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    if scheme != "https" {
+        return url.to_owned();
+    }
+
+    let (authority, suffix) = match remainder.split_once('/') {
+        Some((authority, suffix)) => (authority, format!("/{suffix}")),
+        None => (remainder, String::new()),
+    };
+
+    let rewritten_authority = match authority {
+        "ones.cn" => "sz.ones.cn",
+        "ones.com" => "us.ones.com",
+        _ => return url.to_owned(),
+    };
+
+    format!("{scheme}://{rewritten_authority}{suffix}")
 }
 
 async fn initialize_upstream(
@@ -1664,10 +1718,10 @@ mod tests {
     use tokio::net::UnixListener;
 
     use super::{
-        ToolCache, cache_scope_key, cache_scope_path_component, call_tool, parse_status_response,
-        read_cached_tool_summaries, read_downstream_message_frame, reset_broken_daemon_state,
-        resolve_socket_path, sort_tool_values, tool_cache_dir, urls_share_cache_scope,
-        write_downstream_message, write_tool_cache_if_changed,
+        ToolCache, cache_scope_key, cache_scope_path_component, call_tool, ensure_mcp_url_suffix,
+        parse_status_response, read_cached_tool_summaries, read_downstream_message_frame,
+        reset_broken_daemon_state, resolve_socket_path, sort_tool_values, tool_cache_dir,
+        urls_share_cache_scope, write_downstream_message, write_tool_cache_if_changed,
     };
 
     #[test]
@@ -1735,6 +1789,78 @@ mod tests {
         assert_eq!(
             cache_scope_path_component("https://EXAMPLE.COM:8443/api/v1?x=1"),
             "example.com"
+        );
+    }
+
+    #[test]
+    fn appends_mcp_suffix_to_remote_url() {
+        assert_eq!(
+            ensure_mcp_url_suffix("https://example.com/api"),
+            "https://example.com/api/mcp"
+        );
+        assert_eq!(
+            ensure_mcp_url_suffix("https://example.com/api/"),
+            "https://example.com/api/mcp"
+        );
+    }
+
+    #[test]
+    fn preserves_existing_mcp_suffix_on_remote_url() {
+        assert_eq!(
+            ensure_mcp_url_suffix("https://example.com/mcp"),
+            "https://example.com/mcp"
+        );
+        assert_eq!(
+            ensure_mcp_url_suffix("https://example.com/mcp/"),
+            "https://example.com/mcp"
+        );
+    }
+
+    #[test]
+    fn appends_mcp_suffix_before_query_and_fragment() {
+        assert_eq!(
+            ensure_mcp_url_suffix("https://example.com/api?token=abc#tools"),
+            "https://example.com/api/mcp?token=abc#tools"
+        );
+    }
+
+    #[test]
+    fn rewrites_ones_cn_to_sz_ones_cn_before_appending_mcp() {
+        assert_eq!(
+            ensure_mcp_url_suffix("https://ones.cn/api/v1"),
+            "https://sz.ones.cn/api/v1/mcp"
+        );
+    }
+
+    #[test]
+    fn rewrites_ones_com_to_us_ones_com_before_appending_mcp() {
+        assert_eq!(
+            ensure_mcp_url_suffix("https://ones.com/api/v1"),
+            "https://us.ones.com/api/v1/mcp"
+        );
+    }
+
+    #[test]
+    fn preserves_query_and_fragment_when_rewriting_known_domains() {
+        assert_eq!(
+            ensure_mcp_url_suffix("https://ones.cn/api?token=abc#tools"),
+            "https://sz.ones.cn/api/mcp?token=abc#tools"
+        );
+        assert_eq!(
+            ensure_mcp_url_suffix("https://ones.com/api/?token=abc#tools"),
+            "https://us.ones.com/api/mcp?token=abc#tools"
+        );
+    }
+
+    #[test]
+    fn does_not_rewrite_other_hosts_or_http_urls() {
+        assert_eq!(
+            ensure_mcp_url_suffix("https://example.com/api"),
+            "https://example.com/api/mcp"
+        );
+        assert_eq!(
+            ensure_mcp_url_suffix("http://ones.cn/api"),
+            "http://ones.cn/api/mcp"
         );
     }
 

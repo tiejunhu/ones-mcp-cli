@@ -132,7 +132,7 @@ Different hosts use different default Unix sockets, so multiple daemons for diff
 
 `daemon run --foreground` keeps the daemon attached to the current process.
 
-The daemon listens on a Unix socket and starts exactly one `npx -y mcp-remote <url>` child process for its lifetime. It keeps ownership of that stdio session so it can initialize MCP itself, refresh the cached tool list, and proxy the local client over the same upstream connection.
+The daemon listens on a Unix socket and starts exactly one `npx -y mcp-remote <url>` child process for its lifetime. Before spawning `mcp-remote`, the CLI normalizes the configured URL: `https://ones.cn/...` is rewritten to `https://sz.ones.cn/...`, `https://ones.com/...` is rewritten to `https://us.ones.com/...`, and the final upstream URL always ends with `/mcp`. It keeps ownership of that stdio session so it can initialize MCP itself, refresh the cached tool list, and proxy the local client over the same upstream connection.
 
 When `daemon run` spawns the background daemon, it passes the current `--url` override through to the detached process.
 
