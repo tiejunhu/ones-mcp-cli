@@ -1,5 +1,6 @@
 use std::env;
 use std::error::Error;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -9,6 +10,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand, error::ErrorKind};
 use serde::{Deserialize, Serialize};
 
 mod daemon;
+mod tool;
 
 #[derive(Parser, Debug)]
 #[command(name = "ones-mcp-cli")]
@@ -28,6 +30,8 @@ enum Commands {
     Config(ConfigCommand),
     #[command(hide = true)]
     Daemon(DaemonCommand),
+    #[command(external_subcommand)]
+    Tool(Vec<OsString>),
 }
 
 #[derive(Args, Debug)]
@@ -84,10 +88,23 @@ struct StoredConfig {
 
 #[tokio::main]
 async fn main() {
-    let cli = match Cli::try_parse() {
+    let args = env::args_os().collect::<Vec<_>>();
+    let cli = match Cli::try_parse_from(&args) {
         Ok(cli) => cli,
         Err(error) => match error.kind() {
-            ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+            ErrorKind::DisplayHelp => {
+                if should_render_root_help_for_args(args.iter().skip(1)) {
+                    let help_cache_url = help_cache_url_for_args(&args);
+                    print!(
+                        "{}",
+                        render_root_help_with_tools(None, help_cache_url.as_deref())
+                    );
+                } else {
+                    print!("{error}");
+                }
+                process::exit(0);
+            }
+            ErrorKind::DisplayVersion => {
                 print!("{error}");
                 process::exit(0);
             }
@@ -108,6 +125,167 @@ fn should_print_help(arg_count: usize) -> bool {
     arg_count == 1
 }
 
+fn should_render_root_help_for_args<I, T>(args: I) -> bool
+where
+    I: IntoIterator<Item = T>,
+    T: AsRef<OsStr>,
+{
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        let arg = arg.as_ref().to_string_lossy();
+        if arg == "-h" || arg == "--help" {
+            continue;
+        }
+
+        if arg == "--config" {
+            let _ = args.next();
+            continue;
+        }
+
+        if arg.starts_with("--config=") {
+            continue;
+        }
+
+        return false;
+    }
+
+    true
+}
+
+fn render_root_help_with_tools(socket_override: Option<&Path>, url: Option<&str>) -> String {
+    let mut help = Cli::command().render_help().to_string();
+
+    if let Some(url) = url {
+        if let Ok(tools) = daemon::read_cached_tool_summaries(url, socket_override) {
+            if !tools.is_empty() {
+                help = replace_commands_section(&help, &tools);
+            }
+        }
+    }
+
+    if !help.ends_with('\n') {
+        help.push('\n');
+    }
+
+    help
+}
+
+fn replace_commands_section(help: &str, tools: &[daemon::CachedToolSummary]) -> String {
+    let Some((section_start, section_end)) = find_commands_section_bounds(help) else {
+        let mut output = help.trim_end().to_owned();
+        output.push_str("\n\nCommands:\n");
+        output.push_str(&format_commands_section(&[], tools));
+        output.push('\n');
+        return output;
+    };
+
+    let existing = &help[section_start..section_end];
+    let parsed_commands = parse_command_section(existing);
+    let rendered_commands = format_commands_section(&parsed_commands, tools);
+    let mut output = String::with_capacity(help.len() + rendered_commands.len());
+    output.push_str(&help[..section_start]);
+    output.push_str(&rendered_commands);
+    output.push_str(&help[section_end..]);
+    output
+}
+
+fn format_commands_section(
+    commands: &[HelpCommandSummary],
+    tools: &[daemon::CachedToolSummary],
+) -> String {
+    let width = commands
+        .iter()
+        .map(|command| command.name.chars().count())
+        .chain(tools.iter().map(|tool| tool.name.chars().count()))
+        .max()
+        .unwrap_or(0);
+    let mut output = String::new();
+
+    for command in commands {
+        match command.description.as_deref() {
+            Some(description) => {
+                output.push_str(&format!(
+                    "  {:width$}  {description}\n",
+                    command.name,
+                    width = width
+                ));
+            }
+            None => output.push_str(&format!("  {}\n", command.name)),
+        }
+    }
+
+    for tool in tools {
+        match tool.description.as_deref() {
+            Some(description) => {
+                let description = truncate_tool_description(description, 100);
+                output.push_str(&format!(
+                    "  {:width$}  {description}\n",
+                    tool.name,
+                    width = width
+                ));
+            }
+            None => output.push_str(&format!("  {}\n", tool.name)),
+        }
+    }
+
+    output
+}
+
+fn find_commands_section_bounds(help: &str) -> Option<(usize, usize)> {
+    let commands_header = "\nCommands:\n";
+    let commands_start = help.find(commands_header)?;
+    let section_start = commands_start + commands_header.len();
+
+    match help[section_start..].find("\n\n") {
+        Some(section_end) => Some((section_start, section_start + section_end)),
+        None => Some((section_start, help.len())),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct HelpCommandSummary {
+    name: String,
+    description: Option<String>,
+}
+
+fn parse_command_section(section: &str) -> Vec<HelpCommandSummary> {
+    section
+        .lines()
+        .filter_map(parse_command_line)
+        .collect::<Vec<_>>()
+}
+
+fn parse_command_line(line: &str) -> Option<HelpCommandSummary> {
+    let trimmed = line.strip_prefix("  ")?;
+    let separator = trimmed.char_indices().find_map(|(index, ch)| {
+        (ch == ' ' && trimmed[index..].starts_with("  ")).then_some(index)
+    })?;
+    let name = trimmed[..separator].trim();
+    let description = trimmed[separator..].trim();
+
+    if name.is_empty() {
+        return None;
+    }
+
+    Some(HelpCommandSummary {
+        name: name.to_owned(),
+        description: (!description.is_empty()).then(|| description.to_owned()),
+    })
+}
+
+fn truncate_tool_description(description: &str, max_chars: usize) -> String {
+    let normalized = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    let char_count = normalized.chars().count();
+
+    if char_count <= max_chars {
+        return normalized;
+    }
+
+    let truncated = normalized.chars().take(max_chars).collect::<String>();
+    format!("{truncated}...")
+}
+
 async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     let arg_count = env::args_os().len();
     let config_path = resolve_config_path(cli.config.clone())?;
@@ -120,8 +298,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         ensure_url_configured(&config_path, cli.config.as_deref())?;
     }
 
+    let configured_url = if command_requires_config_url(cli.command.as_ref()) {
+        Some(read_configured_url(&config_path)?)
+    } else {
+        None
+    };
+
     if command_requires_daemon_ready(cli.command.as_ref()) {
         daemon::ensure_daemon_running(
+            configured_url
+                .as_deref()
+                .ok_or("configured url is required before starting the daemon")?,
             cli.config.as_deref(),
             command_socket_override(cli.command.as_ref()),
         )
@@ -131,13 +318,30 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command {
         Some(Commands::Config(command)) => run_config_command(command, &config_path)?,
         Some(Commands::Daemon(command)) => {
-            run_daemon_command(command, &config_path, cli.config.as_deref()).await?;
+            run_daemon_command(
+                command,
+                &config_path,
+                cli.config.as_deref(),
+                configured_url.as_deref(),
+            )
+            .await?;
+        }
+        Some(Commands::Tool(args)) => {
+            tool::run_tool_command(
+                &args,
+                None,
+                configured_url
+                    .as_deref()
+                    .ok_or("configured url is required before loading cached tools")?,
+            )
+            .await?;
         }
         None => {
             if should_print_help(arg_count) {
-                let mut command = Cli::command();
-                command.print_help().expect("failed to print help");
-                println!();
+                print!(
+                    "{}",
+                    render_root_help_with_tools(None, configured_url.as_deref())
+                );
             }
         }
     }
@@ -149,15 +353,20 @@ async fn run_daemon_command(
     command: DaemonCommand,
     config_path: &Path,
     config_override: Option<&Path>,
+    configured_url: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     match command.command {
         DaemonSubcommands::Run(run) => {
+            let url = if let Some(url) = configured_url {
+                url.to_owned()
+            } else {
+                read_configured_url(config_path)?
+            };
             if run.foreground {
-                let url = read_configured_url(config_path)?;
                 daemon::run_daemon(&url, command.socket.as_deref()).await?;
             } else {
                 let status =
-                    daemon::ensure_daemon_running(config_override, command.socket.as_deref())
+                    daemon::ensure_daemon_running(&url, config_override, command.socket.as_deref())
                         .await?;
                 println!("daemon ({status}) is running");
             }
@@ -176,7 +385,10 @@ async fn run_daemon_command(
 }
 
 fn command_requires_runtime_checks(command: Option<&Commands>) -> bool {
-    !matches!(command, Some(Commands::Config(_)) | Some(Commands::Daemon(_)))
+    !matches!(
+        command,
+        Some(Commands::Config(_)) | Some(Commands::Daemon(_))
+    )
 }
 
 fn command_requires_config_url(command: Option<&Commands>) -> bool {
@@ -188,11 +400,15 @@ fn command_requires_config_url(command: Option<&Commands>) -> bool {
             ..
         })) => true,
         Some(Commands::Daemon(_)) => false,
+        Some(Commands::Tool(_)) => true,
     }
 }
 
 fn command_requires_daemon_ready(command: Option<&Commands>) -> bool {
-    !matches!(command, Some(Commands::Config(_)) | Some(Commands::Daemon(_)))
+    !matches!(
+        command,
+        Some(Commands::Config(_)) | Some(Commands::Daemon(_))
+    )
 }
 
 fn command_socket_override(command: Option<&Commands>) -> Option<&Path> {
@@ -236,6 +452,31 @@ fn ensure_url_configured(
         Some(url) if !url.trim().is_empty() => Ok(()),
         _ => Err(missing_url_error(config_path, config_override).into()),
     }
+}
+
+fn help_cache_url_for_args(args: &[OsString]) -> Option<String> {
+    let mut args = args.iter().skip(1);
+    let mut config_override = None;
+
+    while let Some(arg) = args.next() {
+        let arg = arg.to_string_lossy();
+        if arg == "-h" || arg == "--help" {
+            continue;
+        }
+
+        if arg == "--config" {
+            config_override = args.next().map(PathBuf::from);
+            continue;
+        }
+
+        if let Some(path) = arg.strip_prefix("--config=") {
+            config_override = Some(PathBuf::from(path));
+            continue;
+        }
+    }
+
+    let config_path = resolve_config_path(config_override).ok()?;
+    read_configured_url(&config_path).ok()
 }
 
 fn read_configured_url(config_path: &Path) -> Result<String, Box<dyn Error>> {

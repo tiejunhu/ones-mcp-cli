@@ -5,10 +5,11 @@ use clap::{CommandFactory, Parser};
 use crate::Cli;
 
 use super::{
-    command_requires_config_url, command_requires_daemon_ready,
-    command_requires_runtime_checks, command_socket_override, command_version,
-    format_clap_error, missing_url_error, parse_node_major_version, parse_url,
-    resolve_config_path, should_print_help,
+    command_requires_config_url, command_requires_daemon_ready, command_requires_runtime_checks,
+    command_socket_override, command_version, find_commands_section_bounds, format_clap_error,
+    format_commands_section, missing_url_error, parse_command_line, parse_node_major_version,
+    parse_url, render_root_help_with_tools, resolve_config_path, should_print_help,
+    should_render_root_help_for_args, truncate_tool_description,
 };
 
 #[test]
@@ -140,8 +141,7 @@ fn daemon_commands_do_not_require_program_startup_daemon_check() {
 
 #[test]
 fn config_commands_do_not_require_program_startup_daemon_check() {
-    let cli =
-        Cli::try_parse_from(["mcp-cli", "config", "show"]).expect("expected config show");
+    let cli = Cli::try_parse_from(["mcp-cli", "config", "show"]).expect("expected config show");
     assert!(!command_requires_daemon_ready(cli.command.as_ref()));
     assert!(!command_requires_runtime_checks(cli.command.as_ref()));
     assert!(!command_requires_config_url(cli.command.as_ref()));
@@ -172,6 +172,14 @@ fn daemon_status_does_not_require_config_url() {
 }
 
 #[test]
+fn tool_commands_require_runtime_checks_and_daemon() {
+    let cli = Cli::try_parse_from(["mcp-cli", "who_am_i"]).expect("expected tool command");
+    assert!(command_requires_runtime_checks(cli.command.as_ref()));
+    assert!(command_requires_config_url(cli.command.as_ref()));
+    assert!(command_requires_daemon_ready(cli.command.as_ref()));
+}
+
+#[test]
 fn parses_hidden_daemon_status_subcommand() {
     let cli = Cli::try_parse_from(["mcp-cli", "daemon", "status"]).expect("expected daemon status");
     assert!(matches!(cli.command, Some(crate::Commands::Daemon(_))));
@@ -184,6 +192,22 @@ fn parses_hidden_daemon_exit_subcommand() {
 }
 
 #[test]
+fn parses_external_tool_subcommand() {
+    let cli = Cli::try_parse_from(["mcp-cli", "who_am_i", "--includeDetails", "true"])
+        .expect("expected external tool command");
+
+    match cli.command {
+        Some(crate::Commands::Tool(args)) => {
+            assert_eq!(args.len(), 3);
+            assert_eq!(args[0].to_string_lossy(), "who_am_i");
+            assert_eq!(args[1].to_string_lossy(), "--includeDetails");
+            assert_eq!(args[2].to_string_lossy(), "true");
+        }
+        other => panic!("expected external tool command, got {other:?}"),
+    }
+}
+
+#[test]
 fn hides_daemon_subcommand_from_help() {
     let help = Cli::command().render_help().to_string();
     assert!(!help.contains("daemon"));
@@ -193,4 +217,120 @@ fn hides_daemon_subcommand_from_help() {
 fn prints_help_only_when_no_arguments_are_provided() {
     assert!(should_print_help(1));
     assert!(!should_print_help(2));
+}
+
+#[test]
+fn root_help_detection_accepts_help_flags_and_global_config() {
+    assert!(should_render_root_help_for_args(["-h"]));
+    assert!(should_render_root_help_for_args(["--help"]));
+    assert!(should_render_root_help_for_args([
+        "--config",
+        "/tmp/config.toml",
+        "-h",
+    ]));
+    assert!(should_render_root_help_for_args([
+        "--config=/tmp/config.toml",
+        "--help",
+    ]));
+}
+
+#[test]
+fn root_help_detection_rejects_subcommand_help() {
+    assert!(!should_render_root_help_for_args(["config", "-h"]));
+    assert!(!should_render_root_help_for_args(["daemon", "-h"]));
+}
+
+#[test]
+fn formats_commands_section_with_aligned_descriptions() {
+    let section = format_commands_section(
+        &[super::HelpCommandSummary {
+            name: "config".to_owned(),
+            description: Some("Manage CLI configuration".to_owned()),
+        }],
+        &[
+            crate::daemon::CachedToolSummary {
+                name: "alpha".to_owned(),
+                description: Some("Alpha tool".to_owned()),
+            },
+            crate::daemon::CachedToolSummary {
+                name: "beta".to_owned(),
+                description: Some("Beta tool".to_owned()),
+            },
+        ],
+    );
+
+    assert!(section.contains("  config  Manage CLI configuration"));
+    assert!(section.contains("  alpha   Alpha tool"));
+    assert!(section.contains("  beta    Beta tool"));
+}
+
+#[test]
+fn truncates_tool_descriptions_to_single_line_and_100_chars() {
+    let description = "line one\nline two\tline three ".repeat(10);
+    let truncated = truncate_tool_description(&description, 100);
+
+    assert!(!truncated.contains('\n'));
+    assert!(!truncated.contains('\t'));
+    assert_eq!(truncated.chars().count(), 103);
+    assert!(truncated.ends_with("..."));
+}
+
+#[test]
+fn finds_commands_section_bounds() {
+    let help = "Usage: test\n\nCommands:\n  config  Config command\n\nOptions:\n  -h, --help\n";
+    let (section_start, section_end) =
+        find_commands_section_bounds(help).expect("expected commands section");
+
+    assert_eq!(
+        &help[section_start..section_end],
+        "  config  Config command"
+    );
+}
+
+#[test]
+fn parses_command_lines_from_clap_help() {
+    let command =
+        parse_command_line("  help    Print this message or the help of the given subcommand(s)")
+            .expect("expected command line");
+
+    assert_eq!(command.name, "help");
+    assert_eq!(
+        command.description.as_deref(),
+        Some("Print this message or the help of the given subcommand(s)")
+    );
+}
+
+#[test]
+fn root_help_includes_cached_tools_when_available() {
+    let temp_dir = std::env::temp_dir().join(format!("ones-mcp-cli-help-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir).expect("expected temp dir");
+    let socket_path = temp_dir.join("daemon.sock");
+    let cache_dir = temp_dir.join("tool-cache").join("example.com");
+    std::fs::create_dir_all(&cache_dir).expect("expected tool cache dir");
+    std::fs::write(
+        cache_dir.join("tools.json"),
+        serde_json::json!({
+            "url": "https://example.com",
+            "tools": [
+                { "name": "alpha", "description": "Alpha tool" },
+                { "name": "beta", "description": "Beta tool" }
+            ]
+        })
+        .to_string(),
+    )
+    .expect("expected tool cache");
+
+    let help = render_root_help_with_tools(Some(&socket_path), Some("https://example.com"));
+
+    assert_eq!(help.matches("\nCommands:\n").count(), 1);
+    assert!(help.contains("alpha"));
+    assert!(help.contains("Alpha tool"));
+    assert!(help.contains("config"));
+    assert!(help.contains("  config  "));
+    assert!(help.contains("  help  "));
+    assert!(help.find("config").unwrap() < help.find("alpha").unwrap());
+    assert!(help.find("help").unwrap() < help.find("alpha").unwrap());
+    assert!(help.contains("given subcommand(s)\n  alpha"));
+
+    std::fs::remove_dir_all(&temp_dir).expect("expected temp dir cleanup");
 }

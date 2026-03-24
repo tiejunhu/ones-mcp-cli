@@ -34,17 +34,28 @@ pub(crate) struct DaemonStatus {
     pub(crate) version: String,
     pub(crate) pid: u32,
     pub(crate) control_socket_path: PathBuf,
+    pub(crate) url: Option<String>,
 }
 
 impl std::fmt::Display for DaemonStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "version {}, pid {}, control {}",
-            self.version,
-            self.pid,
-            self.control_socket_path.display()
-        )
+        match &self.url {
+            Some(url) => write!(
+                f,
+                "version {}, pid {}, url {}, control {}",
+                self.version,
+                self.pid,
+                url,
+                self.control_socket_path.display()
+            ),
+            None => write!(
+                f,
+                "version {}, pid {}, control {}",
+                self.version,
+                self.pid,
+                self.control_socket_path.display()
+            ),
+        }
     }
 }
 
@@ -52,6 +63,20 @@ impl std::fmt::Display for DaemonStatus {
 struct ToolCache {
     url: String,
     tools: Vec<Value>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CachedToolSummary {
+    pub(crate) name: String,
+    pub(crate) description: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub(crate) struct CachedTool {
+    pub(crate) name: String,
+    pub(crate) description: Option<String>,
+    #[serde(rename = "inputSchema", default)]
+    pub(crate) input_schema: Value,
 }
 
 #[derive(Debug)]
@@ -95,7 +120,7 @@ pub(crate) async fn run_daemon(
 ) -> Result<(), Box<dyn Error>> {
     let socket_path = resolve_socket_path(socket_override)?;
     let control_socket_path = control_socket_path(&socket_path)?;
-    let tool_cache_path = tool_cache_path(socket_override)?;
+    let tool_cache_path = tool_cache_path(url, socket_override)?;
 
     prepare_socket_path(&socket_path)?;
     prepare_socket_path(&control_socket_path)?;
@@ -118,6 +143,7 @@ pub(crate) async fn run_daemon(
     );
     let control = run_control_server(
         control_listener,
+        url.to_owned(),
         control_socket_path.clone(),
         shutdown_tx.clone(),
         shutdown_rx.clone(),
@@ -155,35 +181,45 @@ pub(crate) async fn run_daemon(
 }
 
 pub(crate) async fn ensure_daemon_running(
+    url: &str,
     config_override: Option<&Path>,
     socket_override: Option<&Path>,
 ) -> Result<DaemonStatus, Box<dyn Error>> {
     let status = match probe_status(socket_override).await? {
-        Some(status) if status.version == env!("CARGO_PKG_VERSION") => Ok(status),
+        Some(status)
+            if status.version == env!("CARGO_PKG_VERSION")
+                && status
+                    .url
+                    .as_deref()
+                    .is_some_and(|status_url| urls_share_cache_scope(status_url, url)) =>
+        {
+            Ok(status)
+        }
         Some(_) => {
             request_exit(socket_override).await?;
-            spawn_detached_daemon(config_override, socket_override)?;
+            spawn_detached_daemon(url, config_override, socket_override)?;
             request_status(socket_override).await
         }
         None => {
             reset_broken_daemon_state(socket_override)?;
-            spawn_detached_daemon(config_override, socket_override)?;
+            spawn_detached_daemon(url, config_override, socket_override)?;
             request_status(socket_override).await
         }
     }?;
 
-    wait_for_tool_cache(socket_override).await?;
+    wait_for_tool_cache(url, socket_override).await?;
     Ok(status)
 }
 
 pub(crate) fn spawn_detached_daemon(
+    url: &str,
     config_override: Option<&Path>,
     socket_override: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
     let executable = env::current_exe()?;
     let socket_path = resolve_socket_path(socket_override)?;
     let control_socket_path = control_socket_path(&socket_path)?;
-    let tool_cache_path = tool_cache_path(socket_override)?;
+    let tool_cache_path = tool_cache_path(url, socket_override)?;
     let startup_log_path = daemon_startup_log_path(&control_socket_path)?;
     let mut command = std::process::Command::new(executable);
 
@@ -239,6 +275,69 @@ pub(crate) async fn request_exit(socket_override: Option<&Path>) -> Result<(), B
     }
 
     wait_until_stopped(&socket_path, &control_socket_path).await
+}
+
+pub(crate) async fn call_tool(
+    socket_override: Option<&Path>,
+    name: &str,
+    arguments: Value,
+) -> Result<Value, Box<dyn Error>> {
+    let socket_path = resolve_socket_path(socket_override)?;
+    let stream = UnixStream::connect(&socket_path).await.map_err(|error| {
+        format!(
+            "failed to connect to daemon socket {}: {error}",
+            socket_path.display()
+        )
+    })?;
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+
+    let initialize_id = Value::String("ones-mcp-cli-client:initialize".to_owned());
+    write_downstream_message(
+        &mut writer,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": initialize_id.clone(),
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "ones-mcp-cli",
+                    "version": env!("CARGO_PKG_VERSION"),
+                }
+            }
+        }),
+    )
+    .await?;
+    let initialize_response = read_downstream_response_for_id(&mut reader, &initialize_id).await?;
+    response_result(&initialize_response, "initialize")?;
+    write_downstream_message(
+        &mut writer,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        }),
+    )
+    .await?;
+
+    let request_id = Value::String("ones-mcp-cli-client:tools/call".to_owned());
+    write_downstream_message(
+        &mut writer,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": request_id.clone(),
+            "method": "tools/call",
+            "params": {
+                "name": name,
+                "arguments": arguments,
+            }
+        }),
+    )
+    .await?;
+
+    let response = read_downstream_response_for_id(&mut reader, &request_id).await?;
+    response_result(&response, "tools/call")
 }
 
 pub(crate) fn resolve_socket_path(
@@ -346,7 +445,9 @@ fn remove_socket_file_if_present(path: &Path) -> Result<bool, Box<dyn Error>> {
             Ok(true)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(format!("failed to inspect socket path {}: {error}", path.display()).into()),
+        Err(error) => {
+            Err(format!("failed to inspect socket path {}: {error}", path.display()).into())
+        }
     }
 }
 
@@ -513,12 +614,17 @@ fn socket_path_exists(path: &Path) -> Result<bool, Box<dyn Error>> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(format!("failed to inspect socket path {}: {error}", path.display()).into()),
+        Err(error) => {
+            Err(format!("failed to inspect socket path {}: {error}", path.display()).into())
+        }
     }
 }
 
-async fn wait_for_tool_cache(socket_override: Option<&Path>) -> Result<(), Box<dyn Error>> {
-    let cache_path = tool_cache_path(socket_override)?;
+async fn wait_for_tool_cache(
+    url: &str,
+    socket_override: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
+    let cache_path = tool_cache_path(url, socket_override)?;
 
     for _ in 0..TOOL_CACHE_READY_RETRIES {
         match fs::metadata(&cache_path) {
@@ -656,6 +762,7 @@ async fn run_bridge(
 
 async fn run_control_server(
     listener: UnixListener,
+    url: String,
     control_socket_path: PathBuf,
     shutdown_tx: watch::Sender<bool>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -664,7 +771,7 @@ async fn run_control_server(
         tokio::select! {
             result = listener.accept() => {
                 let (stream, _) = result?;
-                if let Some(flow) = handle_control_request(stream, &control_socket_path, &shutdown_tx).await? {
+                if let Some(flow) = handle_control_request(stream, &url, &control_socket_path, &shutdown_tx).await? {
                     return Ok(flow);
                 }
             }
@@ -778,6 +885,7 @@ async fn handle_connection(
 
 async fn handle_control_request(
     stream: UnixStream,
+    url: &str,
     control_socket_path: &Path,
     shutdown_tx: &watch::Sender<bool>,
 ) -> Result<Option<ControlFlow>, Box<dyn Error>> {
@@ -793,9 +901,10 @@ async fn handle_control_request(
     match request.trim() {
         "status" => {
             let response = format!(
-                "running version={} pid={} control={}\n",
+                "running version={} pid={} url={} control={}\n",
                 env!("CARGO_PKG_VERSION"),
                 std::process::id(),
+                url,
                 control_socket_path.display()
             );
             writer.write_all(response.as_bytes()).await?;
@@ -1113,7 +1222,27 @@ where
     }
 }
 
-async fn read_upstream_message<R>(reader: &mut BufReader<R>) -> Result<Option<Value>, Box<dyn Error>>
+async fn read_downstream_response_for_id<R>(
+    reader: &mut BufReader<R>,
+    request_id: &Value,
+) -> Result<Value, Box<dyn Error>>
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        let message = read_downstream_message_frame(reader)
+            .await?
+            .ok_or("daemon closed the MCP connection while waiting for a response")?;
+
+        if message_id(&message) == Some(request_id) {
+            return Ok(message);
+        }
+    }
+}
+
+async fn read_upstream_message<R>(
+    reader: &mut BufReader<R>,
+) -> Result<Option<Value>, Box<dyn Error>>
 where
     R: AsyncRead + Unpin,
 {
@@ -1188,10 +1317,7 @@ where
     Ok(())
 }
 
-async fn write_downstream_message<W>(
-    writer: &mut W,
-    message: &Value,
-) -> Result<(), Box<dyn Error>>
+async fn write_downstream_message<W>(writer: &mut W, message: &Value) -> Result<(), Box<dyn Error>>
 where
     W: AsyncWrite + Unpin,
 {
@@ -1285,16 +1411,102 @@ fn tool_name(tool: &Value) -> Option<&str> {
     tool.get("name").and_then(Value::as_str)
 }
 
-fn tool_cache_path(socket_override: Option<&Path>) -> Result<PathBuf, Box<dyn Error>> {
-    let socket_path = resolve_socket_path(socket_override)?;
-    Ok(tool_cache_dir(&socket_path)?.join(TOOL_CACHE_FILE_NAME))
+pub(crate) fn read_cached_tool_summaries(
+    url: &str,
+    socket_override: Option<&Path>,
+) -> Result<Vec<CachedToolSummary>, Box<dyn Error>> {
+    Ok(read_cached_tools(url, socket_override)?
+        .into_iter()
+        .map(|tool| CachedToolSummary {
+            name: tool.name,
+            description: tool.description,
+        })
+        .collect())
 }
 
-fn tool_cache_dir(socket_path: &Path) -> Result<PathBuf, Box<dyn Error>> {
-    socket_path
+pub(crate) fn read_cached_tools(
+    url: &str,
+    socket_override: Option<&Path>,
+) -> Result<Vec<CachedTool>, Box<dyn Error>> {
+    let cache_path = tool_cache_path(url, socket_override)?;
+
+    match fs::read_to_string(&cache_path) {
+        Ok(contents) => {
+            let mut cache: ToolCache = serde_json::from_str(&contents)?;
+            let mut tools = cache
+                .tools
+                .drain(..)
+                .filter_map(|tool| serde_json::from_value::<CachedTool>(tool).ok())
+                .collect::<Vec<_>>();
+            tools.sort_by(|left, right| left.name.cmp(&right.name));
+            Ok(tools)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!(
+            "failed to read tool cache {}: {error}",
+            cache_path.display()
+        )
+        .into()),
+    }
+}
+
+fn tool_cache_path(url: &str, socket_override: Option<&Path>) -> Result<PathBuf, Box<dyn Error>> {
+    let socket_path = resolve_socket_path(socket_override)?;
+    Ok(tool_cache_dir(&socket_path, url)?.join(TOOL_CACHE_FILE_NAME))
+}
+
+fn tool_cache_dir(socket_path: &Path, url: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let cache_root = socket_path
         .parent()
         .map(Path::to_path_buf)
-        .ok_or_else(|| "failed to determine tool cache directory".into())
+        .ok_or_else(|| -> Box<dyn Error> { "failed to determine tool cache directory".into() })?;
+    Ok(cache_root
+        .join("tool-cache")
+        .join(cache_scope_path_component(url)))
+}
+
+fn cache_scope_path_component(url: &str) -> String {
+    let scope = cache_scope_key(url).unwrap_or(url);
+    encode_cache_path_component(scope)
+}
+
+fn urls_share_cache_scope(left: &str, right: &str) -> bool {
+    cache_scope_path_component(left) == cache_scope_path_component(right)
+}
+
+fn cache_scope_key(url: &str) -> Option<&str> {
+    let (_, remainder) = url.split_once("://")?;
+    let authority = remainder
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|authority| !authority.is_empty())?;
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, authority)| authority)
+        .unwrap_or(authority);
+
+    if authority.starts_with('[') {
+        let end = authority.find(']')?;
+        return Some(&authority[1..end]);
+    }
+
+    authority.split(':').next().filter(|host| !host.is_empty())
+}
+
+fn encode_cache_path_component(value: &str) -> String {
+    let normalized = value.to_ascii_lowercase();
+    let mut encoded = String::with_capacity(normalized.len());
+
+    for byte in normalized.bytes() {
+        match byte {
+            b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'-' | b'_' | b'.' => {
+                encoded.push(char::from(byte));
+            }
+            _ => encoded.push_str(&format!("_{byte:02X}")),
+        }
+    }
+
+    encoded
 }
 
 fn write_tool_cache_if_changed(
@@ -1383,14 +1595,31 @@ fn parse_status_response(response: &str) -> Result<DaemonStatus, Box<dyn Error>>
     let (version, response) = response
         .split_once(" pid=")
         .ok_or_else(|| format!("unexpected daemon status response: running version={response}"))?;
-    let (pid, control_socket_path) = response.split_once(" control=").ok_or_else(|| {
+    let (pid, response) = response.split_once(' ').ok_or_else(|| {
         format!("unexpected daemon status response: running version={version} pid={response}")
     })?;
+    let (url, control_socket_path) =
+        if let Some(control_socket_path) = response.strip_prefix("control=") {
+            (None, control_socket_path)
+        } else if let Some(response) = response.strip_prefix("url=") {
+            let (url, control_socket_path) = response.split_once(" control=").ok_or_else(|| {
+            format!(
+                "unexpected daemon status response: running version={version} pid={pid} {response}"
+            )
+        })?;
+            (Some(url.to_owned()), control_socket_path)
+        } else {
+            return Err(format!(
+                "unexpected daemon status response: running version={version} pid={pid} {response}"
+            )
+            .into());
+        };
 
     Ok(DaemonStatus {
         version: version.to_owned(),
         pid: pid.parse()?,
         control_socket_path: PathBuf::from(control_socket_path),
+        url,
     })
 }
 
@@ -1408,26 +1637,47 @@ fn daemon_not_running_error(socket_override: Option<&Path>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::fs;
     use std::os::unix::net::UnixListener as StdUnixListener;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::BufReader;
+    use tokio::net::UnixListener;
 
     use super::{
-        ToolCache, parse_status_response, reset_broken_daemon_state, sort_tool_values,
-        tool_cache_dir, write_tool_cache_if_changed,
+        ToolCache, cache_scope_key, cache_scope_path_component, call_tool, parse_status_response,
+        read_cached_tool_summaries, read_downstream_message_frame, reset_broken_daemon_state,
+        sort_tool_values, tool_cache_dir, urls_share_cache_scope, write_downstream_message,
+        write_tool_cache_if_changed,
     };
 
     #[test]
-    fn parses_daemon_status_response() {
+    fn parses_daemon_status_response_with_url() {
         let status = parse_status_response(
-            "running version=0.1.0 pid=42 control=/tmp/ones-mcp-cli.sock.ctl",
+            "running version=0.1.0 pid=42 url=https://example.com control=/tmp/ones-mcp-cli.sock.ctl",
         )
         .expect("expected daemon status to parse");
 
         assert_eq!(status.version, "0.1.0");
         assert_eq!(status.pid, 42);
+        assert_eq!(status.url.as_deref(), Some("https://example.com"));
+        assert_eq!(
+            status.control_socket_path,
+            Path::new("/tmp/ones-mcp-cli.sock.ctl")
+        );
+    }
+
+    #[test]
+    fn parses_legacy_daemon_status_response_without_url() {
+        let status = parse_status_response(
+            "running version=0.1.0 pid=42 control=/tmp/ones-mcp-cli.sock.ctl",
+        )
+        .expect("expected legacy daemon status to parse");
+
+        assert_eq!(status.version, "0.1.0");
+        assert_eq!(status.pid, 42);
+        assert_eq!(status.url, None);
         assert_eq!(
             status.control_socket_path,
             Path::new("/tmp/ones-mcp-cli.sock.ctl")
@@ -1446,10 +1696,86 @@ mod tests {
     }
 
     #[test]
-    fn tool_cache_dir_is_resolved_from_socket_directory() {
-        let dir = tool_cache_dir(Path::new("/tmp/ones-mcp-cli/daemon.sock"))
-            .expect("expected tool cache dir");
-        assert_eq!(dir, Path::new("/tmp/ones-mcp-cli"));
+    fn extracts_host_for_cache_scope_key() {
+        assert_eq!(
+            cache_scope_key("https://example.com/api/v1?x=1"),
+            Some("example.com")
+        );
+        assert_eq!(
+            cache_scope_key("https://USER:PASS@EXAMPLE.COM:8443/api/v1?x=1"),
+            Some("EXAMPLE.COM")
+        );
+        assert_eq!(cache_scope_key("https://[::1]:8443/api"), Some("::1"));
+    }
+
+    #[test]
+    fn uses_host_for_cache_path_component() {
+        assert_eq!(
+            cache_scope_path_component("https://example.com/api/v1?x=1"),
+            "example.com"
+        );
+        assert_eq!(
+            cache_scope_path_component("https://EXAMPLE.COM:8443/api/v1?x=1"),
+            "example.com"
+        );
+    }
+
+    #[test]
+    fn urls_share_cache_scope_for_same_host() {
+        assert!(urls_share_cache_scope(
+            "https://example.com/api/v1",
+            "http://EXAMPLE.COM:8443/other"
+        ));
+    }
+
+    #[test]
+    fn urls_do_not_share_cache_scope_for_different_hosts() {
+        assert!(!urls_share_cache_scope(
+            "https://example.com/api/v1",
+            "https://example.net/api/v1"
+        ));
+    }
+
+    #[test]
+    fn tool_cache_dir_is_resolved_from_socket_directory_and_url() {
+        let dir = tool_cache_dir(
+            Path::new("/tmp/ones-mcp-cli/daemon.sock"),
+            "https://example.com",
+        )
+        .expect("expected tool cache dir");
+        assert_eq!(dir, Path::new("/tmp/ones-mcp-cli/tool-cache/example.com"));
+    }
+
+    #[test]
+    fn tool_cache_dirs_are_shared_for_same_host() {
+        let left = tool_cache_dir(
+            Path::new("/tmp/ones-mcp-cli/daemon.sock"),
+            "https://example.com/api/v1",
+        )
+        .expect("expected left tool cache dir");
+        let right = tool_cache_dir(
+            Path::new("/tmp/ones-mcp-cli/daemon.sock"),
+            "http://EXAMPLE.COM/other",
+        )
+        .expect("expected right tool cache dir");
+
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn tool_cache_dirs_are_distinct_for_different_hosts() {
+        let left = tool_cache_dir(
+            Path::new("/tmp/ones-mcp-cli/daemon.sock"),
+            "https://example.com",
+        )
+        .expect("expected left tool cache dir");
+        let right = tool_cache_dir(
+            Path::new("/tmp/ones-mcp-cli/daemon.sock"),
+            "https://example.net",
+        )
+        .expect("expected right tool cache dir");
+
+        assert_ne!(left, right);
     }
 
     #[test]
@@ -1493,6 +1819,187 @@ mod tests {
             write_tool_cache_if_changed(&cache_path, &updated)
                 .expect("expected changed cache write")
         );
+    }
+
+    #[test]
+    fn reads_cached_tool_summaries_from_tool_cache() {
+        let temp_dir = unique_temp_dir();
+        let socket_path = temp_dir.join("daemon.sock");
+        let cache_path = tool_cache_dir(&socket_path, "https://example.com")
+            .expect("expected cache dir")
+            .join("tools.json");
+        let cache = ToolCache {
+            url: "https://example.com".to_owned(),
+            tools: vec![
+                json!({ "name": "beta", "description": "Beta tool" }),
+                json!({ "name": "alpha", "description": "Alpha tool" }),
+                json!({ "description": "Ignored tool" }),
+            ],
+        };
+
+        write_tool_cache_if_changed(&cache_path, &cache).expect("expected cache write");
+
+        let tools = read_cached_tool_summaries("https://example.com", Some(&socket_path))
+            .expect("expected cached tools");
+
+        assert_eq!(
+            tools,
+            vec![
+                super::CachedToolSummary {
+                    name: "alpha".to_owned(),
+                    description: Some("Alpha tool".to_owned()),
+                },
+                super::CachedToolSummary {
+                    name: "beta".to_owned(),
+                    description: Some("Beta tool".to_owned()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_cached_tool_summaries_from_matching_url_only() {
+        let temp_dir = unique_temp_dir();
+        let socket_path = temp_dir.join("daemon.sock");
+        let example_com_cache_path = tool_cache_dir(&socket_path, "https://example.com")
+            .expect("expected example.com cache dir")
+            .join("tools.json");
+        let example_net_cache_path = tool_cache_dir(&socket_path, "https://example.net")
+            .expect("expected example.net cache dir")
+            .join("tools.json");
+
+        write_tool_cache_if_changed(
+            &example_com_cache_path,
+            &ToolCache {
+                url: "https://example.com".to_owned(),
+                tools: vec![json!({ "name": "alpha", "description": "Alpha tool" })],
+            },
+        )
+        .expect("expected example.com cache write");
+        write_tool_cache_if_changed(
+            &example_net_cache_path,
+            &ToolCache {
+                url: "https://example.net".to_owned(),
+                tools: vec![json!({ "name": "beta", "description": "Beta tool" })],
+            },
+        )
+        .expect("expected example.net cache write");
+
+        let tools = read_cached_tool_summaries("https://example.net", Some(&socket_path))
+            .expect("expected cached tools");
+
+        assert_eq!(
+            tools,
+            vec![super::CachedToolSummary {
+                name: "beta".to_owned(),
+                description: Some("Beta tool".to_owned()),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_sends_request_through_daemon_socket() {
+        let temp_dir = unique_socket_temp_dir();
+        let socket_path = temp_dir.join("daemon.sock");
+        let listener = UnixListener::bind(&socket_path).expect("expected socket listener");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("expected client connection");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+
+            let initialize = read_downstream_message_frame(&mut reader)
+                .await
+                .expect("expected initialize frame")
+                .expect("expected initialize message");
+            assert_eq!(
+                initialize.get("method").and_then(Value::as_str),
+                Some("initialize")
+            );
+            let initialize_id = initialize
+                .get("id")
+                .cloned()
+                .expect("expected initialize id");
+            write_downstream_message(
+                &mut writer,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": initialize_id,
+                    "result": {
+                        "protocolVersion": super::MCP_PROTOCOL_VERSION,
+                        "capabilities": {}
+                    }
+                }),
+            )
+            .await
+            .expect("expected initialize response");
+
+            let notification = read_downstream_message_frame(&mut reader)
+                .await
+                .expect("expected initialized notification")
+                .expect("expected initialized message");
+            assert_eq!(
+                notification.get("method").and_then(Value::as_str),
+                Some("notifications/initialized")
+            );
+
+            let call = read_downstream_message_frame(&mut reader)
+                .await
+                .expect("expected tools/call frame")
+                .expect("expected tools/call message");
+            assert_eq!(
+                call.get("method").and_then(Value::as_str),
+                Some("tools/call")
+            );
+            assert_eq!(
+                call.pointer("/params/name").and_then(Value::as_str),
+                Some("sample_tool")
+            );
+            assert_eq!(
+                call.pointer("/params/arguments"),
+                Some(&json!({ "issueID": "ISS-1" }))
+            );
+            let call_id = call.get("id").cloned().expect("expected tools/call id");
+            write_downstream_message(
+                &mut writer,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": call_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "ok"
+                            }
+                        ]
+                    }
+                }),
+            )
+            .await
+            .expect("expected tools/call response");
+        });
+
+        let result = call_tool(
+            Some(&socket_path),
+            "sample_tool",
+            json!({ "issueID": "ISS-1" }),
+        )
+        .await
+        .expect("expected tool result");
+
+        assert_eq!(
+            result,
+            json!({
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "ok"
+                    }
+                ]
+            })
+        );
+
+        server.await.expect("expected server task");
     }
 
     #[test]
