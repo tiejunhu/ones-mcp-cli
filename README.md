@@ -9,7 +9,7 @@ The CLI checks these prerequisites on startup for every invocation except `confi
 - `node` must be installed
 - `npx` must be installed
 - `node --version` must report version 18 or above
-- the config file must contain `url` when starting without a command or before `daemon run`
+- either `--url <URL>` or a configured `url` must be available when starting without a command, before `daemon run`, or before calling a tool
 
 Run the CLI without any arguments to show help:
 
@@ -39,6 +39,13 @@ Save the service URL:
 
 ```bash
 cargo run -- config --url https://example.com
+```
+
+Temporarily override the configured URL for a single invocation:
+
+```bash
+cargo run -- --url https://example.com daemon run
+cargo run -- --url https://example.com who_am_i
 ```
 
 Show the current configuration:
@@ -107,28 +114,34 @@ By default the command writes the configuration to:
 
 Use the global `--config` option to override that path.
 
+Use the top-level `--url` option to override the configured URL without writing it back to the config file.
+
 ## Daemon
 
 The `daemon` subcommand is intentionally hidden from the generated CLI help, but it is supported and documented here.
 
-`daemon run` detaches from the current shell, checks whether the daemon is already running, and returns after a compatible daemon is running and the MCP tool cache is ready.
+`daemon run` detaches from the current shell, checks whether the daemon for the current host is already running, and returns after a compatible daemon is running and the MCP tool cache is ready.
 
 If no daemon is running, `daemon run` starts one in the background.
 
-If a daemon is already running and both its version and host match the current CLI configuration, `daemon run` reuses it.
+If a daemon is already running and both its version and host match the current URL, `daemon run` reuses it.
 
-If a daemon is already running but its version or host does not match the current CLI configuration, `daemon run` stops it and starts a new daemon from the current CLI binary.
+If a daemon is already running for the same host but its version does not match the current CLI binary, `daemon run` stops it and starts a new daemon from the current CLI binary.
+
+Different hosts use different default Unix sockets, so multiple daemons for different hosts can run at the same time. The client picks the matching daemon from the current `--url` value, or from the configured `url` when `--url` is not provided.
 
 `daemon run --foreground` keeps the daemon attached to the current process.
 
 The daemon listens on a Unix socket and starts exactly one `npx -y mcp-remote <url>` child process for its lifetime. It keeps ownership of that stdio session so it can initialize MCP itself, refresh the cached tool list, and proxy the local client over the same upstream connection.
 
+When `daemon run` spawns the background daemon, it passes the current `--url` override through to the detached process.
+
 The daemon also opens a control socket next to the public socket with the `.ctl` suffix. `daemon status` and `daemon exit` use that control socket.
 
 The default socket path is:
 
-- `$XDG_RUNTIME_DIR/ones-mcp-cli/daemon.sock` when `XDG_RUNTIME_DIR` is set
-- `~/.cache/ones-mcp-cli/daemon.sock` otherwise
+- `$XDG_RUNTIME_DIR/ones-mcp-cli/daemon-<host>.sock` when `XDG_RUNTIME_DIR` is set
+- `~/.cache/ones-mcp-cli/daemon-<host>.sock` otherwise
 
 Use `--socket` to override the socket path.
 

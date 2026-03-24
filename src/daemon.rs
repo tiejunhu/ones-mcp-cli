@@ -118,7 +118,7 @@ pub(crate) async fn run_daemon(
     url: &str,
     socket_override: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
-    let socket_path = resolve_socket_path(socket_override)?;
+    let socket_path = resolve_socket_path(Some(url), socket_override)?;
     let control_socket_path = control_socket_path(&socket_path)?;
     let tool_cache_path = tool_cache_path(url, socket_override)?;
 
@@ -185,7 +185,7 @@ pub(crate) async fn ensure_daemon_running(
     config_override: Option<&Path>,
     socket_override: Option<&Path>,
 ) -> Result<DaemonStatus, Box<dyn Error>> {
-    let status = match probe_status(socket_override).await? {
+    let status = match probe_status(Some(url), socket_override).await? {
         Some(status)
             if status.version == env!("CARGO_PKG_VERSION")
                 && status
@@ -196,14 +196,14 @@ pub(crate) async fn ensure_daemon_running(
             Ok(status)
         }
         Some(_) => {
-            request_exit(socket_override).await?;
+            request_exit(Some(url), socket_override).await?;
             spawn_detached_daemon(url, config_override, socket_override)?;
-            request_status(socket_override).await
+            request_status(Some(url), socket_override).await
         }
         None => {
             reset_broken_daemon_state(socket_override)?;
             spawn_detached_daemon(url, config_override, socket_override)?;
-            request_status(socket_override).await
+            request_status(Some(url), socket_override).await
         }
     }?;
 
@@ -217,7 +217,7 @@ pub(crate) fn spawn_detached_daemon(
     socket_override: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
     let executable = env::current_exe()?;
-    let socket_path = resolve_socket_path(socket_override)?;
+    let socket_path = resolve_socket_path(Some(url), socket_override)?;
     let control_socket_path = control_socket_path(&socket_path)?;
     let tool_cache_path = tool_cache_path(url, socket_override)?;
     let startup_log_path = daemon_startup_log_path(&control_socket_path)?;
@@ -227,6 +227,7 @@ pub(crate) fn spawn_detached_daemon(
         command.arg("--config").arg(path);
     }
 
+    command.arg("--url").arg(url);
     command.arg("daemon");
 
     if let Some(path) = socket_override {
@@ -257,19 +258,23 @@ pub(crate) fn spawn_detached_daemon(
 }
 
 pub(crate) async fn request_status(
+    url: Option<&str>,
     socket_override: Option<&Path>,
 ) -> Result<DaemonStatus, Box<dyn Error>> {
-    probe_status(socket_override)
+    probe_status(url, socket_override)
         .await?
-        .ok_or_else(|| daemon_not_running_error(socket_override).into())
+        .ok_or_else(|| daemon_not_running_error(url, socket_override).into())
 }
 
-pub(crate) async fn request_exit(socket_override: Option<&Path>) -> Result<(), Box<dyn Error>> {
-    let socket_path = resolve_socket_path(socket_override)?;
+pub(crate) async fn request_exit(
+    url: Option<&str>,
+    socket_override: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
+    let socket_path = resolve_socket_path(url, socket_override)?;
     let control_socket_path = control_socket_path(&socket_path)?;
-    let response = send_control_request(socket_override, "exit")
+    let response = send_control_request(url, socket_override, "exit")
         .await?
-        .ok_or_else(|| daemon_not_running_error(socket_override))?;
+        .ok_or_else(|| daemon_not_running_error(url, socket_override))?;
     if response != "exiting" {
         return Err(format!("unexpected daemon exit response: {response}").into());
     }
@@ -278,11 +283,12 @@ pub(crate) async fn request_exit(socket_override: Option<&Path>) -> Result<(), B
 }
 
 pub(crate) async fn call_tool(
+    url: &str,
     socket_override: Option<&Path>,
     name: &str,
     arguments: Value,
 ) -> Result<Value, Box<dyn Error>> {
-    let socket_path = resolve_socket_path(socket_override)?;
+    let socket_path = resolve_socket_path(Some(url), socket_override)?;
     let stream = UnixStream::connect(&socket_path).await.map_err(|error| {
         format!(
             "failed to connect to daemon socket {}: {error}",
@@ -341,19 +347,22 @@ pub(crate) async fn call_tool(
 }
 
 pub(crate) fn resolve_socket_path(
+    url: Option<&str>,
     socket_override: Option<&Path>,
 ) -> Result<PathBuf, Box<dyn Error>> {
     match socket_override {
         Some(path) => Ok(path.to_path_buf()),
-        None => default_socket_path(),
+        None => default_socket_path(url),
     }
 }
 
-fn default_socket_path() -> Result<PathBuf, Box<dyn Error>> {
+fn default_socket_path(url: Option<&str>) -> Result<PathBuf, Box<dyn Error>> {
+    let socket_file_name = default_socket_file_name(url);
+
     if let Some(runtime_dir) = env::var_os("XDG_RUNTIME_DIR") {
         return Ok(PathBuf::from(runtime_dir)
             .join("ones-mcp-cli")
-            .join("daemon.sock"));
+            .join(socket_file_name));
     }
 
     let home_dir = env::var_os("HOME").ok_or("HOME environment variable is not set")?;
@@ -361,7 +370,14 @@ fn default_socket_path() -> Result<PathBuf, Box<dyn Error>> {
     Ok(PathBuf::from(home_dir)
         .join(".cache")
         .join("ones-mcp-cli")
-        .join("daemon.sock"))
+        .join(socket_file_name))
+}
+
+fn default_socket_file_name(url: Option<&str>) -> String {
+    match url {
+        Some(url) => format!("daemon-{}.sock", cache_scope_path_component(url)),
+        None => "daemon.sock".to_owned(),
+    }
 }
 
 fn control_socket_path(public_socket_path: &Path) -> Result<PathBuf, Box<dyn Error>> {
@@ -413,7 +429,7 @@ fn prepare_socket_path(path: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 fn reset_broken_daemon_state(socket_override: Option<&Path>) -> Result<(), Box<dyn Error>> {
-    let socket_path = resolve_socket_path(socket_override)?;
+    let socket_path = resolve_socket_path(None, socket_override)?;
     let control_socket_path = control_socket_path(&socket_path)?;
 
     let removed_public_socket = remove_socket_file_if_present(&socket_path)?;
@@ -649,7 +665,7 @@ async fn wait_for_tool_cache(
             }
         }
 
-        if probe_status(socket_override).await?.is_none() {
+        if probe_status(Some(url), socket_override).await?.is_none() {
             return Err(format!(
                 "daemon stopped before generating tool cache {}",
                 cache_path.display()
@@ -664,10 +680,11 @@ async fn wait_for_tool_cache(
 }
 
 async fn send_control_request(
+    url: Option<&str>,
     socket_override: Option<&Path>,
     command: &str,
 ) -> Result<Option<String>, Box<dyn Error>> {
-    let socket_path = resolve_socket_path(socket_override)?;
+    let socket_path = resolve_socket_path(url, socket_override)?;
     let control_socket_path = control_socket_path(&socket_path)?;
     let mut stream = match UnixStream::connect(&control_socket_path).await {
         Ok(stream) => stream,
@@ -1451,7 +1468,7 @@ pub(crate) fn read_cached_tools(
 }
 
 fn tool_cache_path(url: &str, socket_override: Option<&Path>) -> Result<PathBuf, Box<dyn Error>> {
-    let socket_path = resolve_socket_path(socket_override)?;
+    let socket_path = resolve_socket_path(Some(url), socket_override)?;
     Ok(tool_cache_dir(&socket_path, url)?.join(TOOL_CACHE_FILE_NAME))
 }
 
@@ -1579,9 +1596,10 @@ impl Drop for SocketFileGuard {
 }
 
 async fn probe_status(
+    url: Option<&str>,
     socket_override: Option<&Path>,
 ) -> Result<Option<DaemonStatus>, Box<dyn Error>> {
-    let Some(response) = send_control_request(socket_override, "status").await? else {
+    let Some(response) = send_control_request(url, socket_override, "status").await? else {
         return Ok(None);
     };
 
@@ -1623,8 +1641,8 @@ fn parse_status_response(response: &str) -> Result<DaemonStatus, Box<dyn Error>>
     })
 }
 
-fn daemon_not_running_error(socket_override: Option<&Path>) -> String {
-    let socket_path = match resolve_socket_path(socket_override) {
+fn daemon_not_running_error(url: Option<&str>, socket_override: Option<&Path>) -> String {
+    let socket_path = match resolve_socket_path(url, socket_override) {
         Ok(path) => path,
         Err(error) => return format!("failed to resolve daemon socket path: {error}"),
     };
@@ -1648,8 +1666,8 @@ mod tests {
     use super::{
         ToolCache, cache_scope_key, cache_scope_path_component, call_tool, parse_status_response,
         read_cached_tool_summaries, read_downstream_message_frame, reset_broken_daemon_state,
-        sort_tool_values, tool_cache_dir, urls_share_cache_scope, write_downstream_message,
-        write_tool_cache_if_changed,
+        resolve_socket_path, sort_tool_values, tool_cache_dir, urls_share_cache_scope,
+        write_downstream_message, write_tool_cache_if_changed,
     };
 
     #[test]
@@ -1744,6 +1762,37 @@ mod tests {
         )
         .expect("expected tool cache dir");
         assert_eq!(dir, Path::new("/tmp/ones-mcp-cli/tool-cache/example.com"));
+    }
+
+    #[test]
+    fn default_socket_path_uses_host_scope() {
+        let path = resolve_socket_path(Some("https://example.com/api/v1"), None)
+            .expect("expected socket path");
+
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("daemon-example.com.sock")
+        );
+    }
+
+    #[test]
+    fn default_socket_paths_are_shared_for_same_host() {
+        let left = resolve_socket_path(Some("https://example.com/api/v1"), None)
+            .expect("expected left socket path");
+        let right = resolve_socket_path(Some("http://EXAMPLE.COM:8443/other"), None)
+            .expect("expected right socket path");
+
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn default_socket_paths_are_distinct_for_different_hosts() {
+        let left =
+            resolve_socket_path(Some("https://example.com"), None).expect("expected left socket");
+        let right =
+            resolve_socket_path(Some("https://example.net"), None).expect("expected right socket");
+
+        assert_ne!(left, right);
     }
 
     #[test]
@@ -1980,6 +2029,7 @@ mod tests {
         });
 
         let result = call_tool(
+            "https://example.com",
             Some(&socket_path),
             "sample_tool",
             json!({ "issueID": "ISS-1" }),

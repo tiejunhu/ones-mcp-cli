@@ -26,7 +26,8 @@ pub(crate) async fn run_tool_command(
     }
 
     let arguments = parse_tool_arguments(&tool, &args[1..])?;
-    let result = daemon::call_tool(socket_override, &tool.name, Value::Object(arguments)).await?;
+    let result =
+        daemon::call_tool(url, socket_override, &tool.name, Value::Object(arguments)).await?;
     println!(
         "{}",
         serde_json::to_string_pretty(display_tool_result(&result))?

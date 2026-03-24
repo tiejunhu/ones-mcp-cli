@@ -29,6 +29,38 @@ fn accepts_https_url() {
 }
 
 #[test]
+fn parses_top_level_url_override() {
+    let cli = Cli::try_parse_from(["mcp-cli", "--url", "https://example.com", "daemon", "run"])
+        .expect("expected top-level url override");
+
+    assert_eq!(cli.url.as_deref(), Some("https://example.com"));
+    assert!(matches!(cli.command, Some(crate::Commands::Daemon(_))));
+}
+
+#[test]
+fn preserves_tool_url_arguments_after_tool_name() {
+    let cli = Cli::try_parse_from([
+        "mcp-cli",
+        "--url",
+        "https://example.com",
+        "sample_tool",
+        "--url",
+        "https://payload.example.com",
+    ])
+    .expect("expected tool url argument");
+
+    match cli.command {
+        Some(crate::Commands::Tool(args)) => {
+            assert_eq!(args.len(), 3);
+            assert_eq!(args[0].to_string_lossy(), "sample_tool");
+            assert_eq!(args[1].to_string_lossy(), "--url");
+            assert_eq!(args[2].to_string_lossy(), "https://payload.example.com");
+        }
+        other => panic!("expected external tool command, got {other:?}"),
+    }
+}
+
+#[test]
 fn rejects_other_schemes() {
     let error = parse_url("ftp://example.com").expect_err("expected invalid url");
     assert_eq!(error, "url must start with http:// or https://");
@@ -132,6 +164,14 @@ fn daemon_socket_override_is_available_for_background_run() {
 }
 
 #[test]
+fn daemon_run_accepts_top_level_url_override() {
+    let cli = Cli::try_parse_from(["mcp-cli", "--url", "https://example.com", "daemon", "run"])
+        .expect("expected daemon run with top-level url override");
+
+    assert_eq!(cli.url.as_deref(), Some("https://example.com"));
+}
+
+#[test]
 fn daemon_commands_do_not_require_program_startup_daemon_check() {
     let cli = Cli::try_parse_from(["mcp-cli", "daemon", "run"]).expect("expected daemon run");
     assert!(!command_requires_daemon_ready(cli.command.as_ref()));
@@ -230,6 +270,15 @@ fn root_help_detection_accepts_help_flags_and_global_config() {
     ]));
     assert!(should_render_root_help_for_args([
         "--config=/tmp/config.toml",
+        "--help",
+    ]));
+    assert!(should_render_root_help_for_args([
+        "--url",
+        "https://example.com",
+        "-h",
+    ]));
+    assert!(should_render_root_help_for_args([
+        "--url=https://example.com",
         "--help",
     ]));
 }

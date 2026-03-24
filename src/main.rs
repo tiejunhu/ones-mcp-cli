@@ -20,6 +20,10 @@ struct Cli {
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
+    /// ONES service URL, overrides the configured url for this invocation
+    #[arg(long, value_parser = parse_url)]
+    url: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -144,6 +148,15 @@ where
         }
 
         if arg.starts_with("--config=") {
+            continue;
+        }
+
+        if arg == "--url" {
+            let _ = args.next();
+            continue;
+        }
+
+        if arg.starts_with("--url=") {
             continue;
         }
 
@@ -289,24 +302,21 @@ fn truncate_tool_description(description: &str, max_chars: usize) -> String {
 async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     let arg_count = env::args_os().len();
     let config_path = resolve_config_path(cli.config.clone())?;
+    let requires_config_url = command_requires_config_url(cli.command.as_ref());
+    let effective_url = resolve_effective_url(
+        cli.url.clone(),
+        &config_path,
+        cli.config.as_deref(),
+        requires_config_url,
+    )?;
 
     if command_requires_runtime_checks(cli.command.as_ref()) {
         check_runtime_requirements()?;
     }
 
-    if command_requires_config_url(cli.command.as_ref()) {
-        ensure_url_configured(&config_path, cli.config.as_deref())?;
-    }
-
-    let configured_url = if command_requires_config_url(cli.command.as_ref()) {
-        Some(read_configured_url(&config_path)?)
-    } else {
-        None
-    };
-
     if command_requires_daemon_ready(cli.command.as_ref()) {
         daemon::ensure_daemon_running(
-            configured_url
+            effective_url
                 .as_deref()
                 .ok_or("configured url is required before starting the daemon")?,
             cli.config.as_deref(),
@@ -322,7 +332,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 command,
                 &config_path,
                 cli.config.as_deref(),
-                configured_url.as_deref(),
+                effective_url.as_deref(),
             )
             .await?;
         }
@@ -330,7 +340,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             tool::run_tool_command(
                 &args,
                 None,
-                configured_url
+                effective_url
                     .as_deref()
                     .ok_or("configured url is required before loading cached tools")?,
             )
@@ -340,7 +350,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             if should_print_help(arg_count) {
                 print!(
                     "{}",
-                    render_root_help_with_tools(None, configured_url.as_deref())
+                    render_root_help_with_tools(None, effective_url.as_deref())
                 );
             }
         }
@@ -357,11 +367,9 @@ async fn run_daemon_command(
 ) -> Result<(), Box<dyn Error>> {
     match command.command {
         DaemonSubcommands::Run(run) => {
-            let url = if let Some(url) = configured_url {
-                url.to_owned()
-            } else {
-                read_configured_url(config_path)?
-            };
+            let url = configured_url
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| missing_url_error(config_path, config_override))?;
             if run.foreground {
                 daemon::run_daemon(&url, command.socket.as_deref()).await?;
             } else {
@@ -372,11 +380,11 @@ async fn run_daemon_command(
             }
         }
         DaemonSubcommands::Status => {
-            let status = daemon::request_status(command.socket.as_deref()).await?;
+            let status = daemon::request_status(configured_url, command.socket.as_deref()).await?;
             println!("daemon ({status}) is running");
         }
         DaemonSubcommands::Exit => {
-            daemon::request_exit(command.socket.as_deref()).await?;
+            daemon::request_exit(configured_url, command.socket.as_deref()).await?;
             println!("daemon exit");
         }
     }
@@ -457,6 +465,7 @@ fn ensure_url_configured(
 fn help_cache_url_for_args(args: &[OsString]) -> Option<String> {
     let mut args = args.iter().skip(1);
     let mut config_override = None;
+    let mut url_override = None;
 
     while let Some(arg) = args.next() {
         let arg = arg.to_string_lossy();
@@ -473,10 +482,44 @@ fn help_cache_url_for_args(args: &[OsString]) -> Option<String> {
             config_override = Some(PathBuf::from(path));
             continue;
         }
+
+        if arg == "--url" {
+            url_override = args
+                .next()
+                .and_then(|value| parse_url(&value.to_string_lossy()).ok());
+            continue;
+        }
+
+        if let Some(url) = arg.strip_prefix("--url=") {
+            url_override = parse_url(url).ok();
+            continue;
+        }
+    }
+
+    if url_override.is_some() {
+        return url_override;
     }
 
     let config_path = resolve_config_path(config_override).ok()?;
     read_configured_url(&config_path).ok()
+}
+
+fn resolve_effective_url(
+    cli_url: Option<String>,
+    config_path: &Path,
+    config_override: Option<&Path>,
+    require_config_url: bool,
+) -> Result<Option<String>, Box<dyn Error>> {
+    if let Some(url) = cli_url {
+        return Ok(Some(url));
+    }
+
+    if require_config_url {
+        ensure_url_configured(config_path, config_override)?;
+        return Ok(Some(read_configured_url(config_path)?));
+    }
+
+    Ok(read_optional_configured_url(config_path))
 }
 
 fn read_configured_url(config_path: &Path) -> Result<String, Box<dyn Error>> {
@@ -487,6 +530,15 @@ fn read_configured_url(config_path: &Path) -> Result<String, Box<dyn Error>> {
         Some(url) if !url.trim().is_empty() => Ok(url),
         _ => Err(format!("missing `url` in config file {}", config_path.display()).into()),
     }
+}
+
+fn read_optional_configured_url(config_path: &Path) -> Option<String> {
+    let config = read_stored_config(config_path).ok()?;
+
+    config.url.and_then(|url| {
+        let trimmed = url.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    })
 }
 
 fn read_stored_config(config_path: &Path) -> Result<StoredConfig, String> {
