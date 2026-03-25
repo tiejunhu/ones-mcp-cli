@@ -13,10 +13,14 @@ mod daemon;
 mod tool;
 
 pub(crate) const CLI_COMMAND_NAME: &str = "omc";
+const CLI_ABOUT: &str = concat!(
+    "ONES MCP command line interface ",
+    env!("CARGO_PKG_VERSION")
+);
 
 #[derive(Parser, Debug)]
 #[command(name = CLI_COMMAND_NAME)]
-#[command(about = "ONES MCP command line interface")]
+#[command(about = CLI_ABOUT)]
 struct Cli {
     /// Path to the config file
     #[arg(long, global = true)]

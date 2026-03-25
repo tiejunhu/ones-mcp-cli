@@ -5,10 +5,11 @@ use clap::{CommandFactory, Parser};
 use crate::Cli;
 
 use super::{
-    command_requires_config_url, command_requires_daemon_ready, command_requires_runtime_checks,
-    command_socket_override, command_version, find_commands_section_bounds, format_clap_error,
-    format_commands_section, missing_url_error, parse_command_line, parse_node_major_version,
-    parse_url, render_root_help_with_tools, resolve_config_path, should_print_help,
+    CLI_ABOUT, command_requires_config_url, command_requires_daemon_ready,
+    command_requires_runtime_checks, command_socket_override, command_version,
+    find_commands_section_bounds, format_clap_error, format_commands_section,
+    missing_url_error, parse_command_line, parse_node_major_version, parse_url,
+    render_root_help_with_tools, resolve_config_path, should_print_help,
     should_render_root_help_for_args, truncate_tool_description,
 };
 
@@ -137,6 +138,13 @@ fn parses_config_show_subcommand() {
 fn parses_hidden_daemon_run_subcommand() {
     let cli = Cli::try_parse_from(["omc", "daemon", "run"]).expect("expected daemon to parse");
     assert!(matches!(cli.command, Some(crate::Commands::Daemon(_))));
+}
+
+#[test]
+fn root_help_appends_current_version_to_about() {
+    let help = Cli::command().render_help().to_string();
+
+    assert!(help.contains(CLI_ABOUT));
 }
 
 #[test]

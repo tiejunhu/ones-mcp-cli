@@ -21,21 +21,34 @@ need_cmd() {
 
 fetch_text() {
   local url="$1"
+  local response
 
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL \
-      -H "Accept: application/vnd.github+json" \
-      -H "User-Agent: ${BINARY_NAME}-install-script" \
-      "$url"
-    return
+    if response="$(
+      curl -fsSL \
+        -H "Accept: application/vnd.github+json" \
+        -H "User-Agent: ${BINARY_NAME}-install-script" \
+        "$url" 2>&1
+    )"; then
+      printf '%s' "$response"
+      return
+    fi
+
+    fatal "failed to fetch ${url}: ${response}"
   fi
 
   if command -v wget >/dev/null 2>&1; then
-    wget -qO- \
-      --header="Accept: application/vnd.github+json" \
-      --header="User-Agent: ${BINARY_NAME}-install-script" \
-      "$url"
-    return
+    if response="$(
+      wget -qO- \
+        --header="Accept: application/vnd.github+json" \
+        --header="User-Agent: ${BINARY_NAME}-install-script" \
+        "$url" 2>&1
+    )"; then
+      printf '%s' "$response"
+      return
+    fi
+
+    fatal "failed to fetch ${url}: ${response}"
   fi
 
   fatal "install requires curl or wget"
@@ -44,15 +57,22 @@ fetch_text() {
 download_file() {
   local url="$1"
   local output="$2"
+  local error_output
 
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --retry 3 --output "$output" "$url"
-    return
+    if error_output="$(curl -fsSL --retry 3 --output "$output" "$url" 2>&1)"; then
+      return
+    fi
+
+    fatal "failed to download ${url}: ${error_output}"
   fi
 
   if command -v wget >/dev/null 2>&1; then
-    wget -O "$output" "$url"
-    return
+    if error_output="$(wget -O "$output" "$url" 2>&1)"; then
+      return
+    fi
+
+    fatal "failed to download ${url}: ${error_output}"
   fi
 
   fatal "install requires curl or wget"
