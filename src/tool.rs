@@ -344,9 +344,14 @@ fn render_tool_help(tool: &CachedTool) -> String {
         output.push_str("\n\n");
     }
 
+    let usage_suffix = if parameters.is_empty() {
+        String::new()
+    } else {
+        " [--<parameter> <value>]".to_owned()
+    };
     output.push_str(&format!(
-        "Usage: {} {} [--<parameter> <value>]\n",
-        CLI_COMMAND_NAME, tool.name
+        "Usage: {} {}{}\n",
+        CLI_COMMAND_NAME, tool.name, usage_suffix
     ));
 
     if !parameters.is_empty() {
@@ -486,6 +491,17 @@ mod tests {
         }
     }
 
+    fn no_parameter_tool() -> CachedTool {
+        CachedTool {
+            name: "who_am_i".to_owned(),
+            description: Some("Return the current user".to_owned()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        }
+    }
+
     #[test]
     fn parses_number_boolean_and_array_arguments() {
         let tool = sample_tool();
@@ -546,10 +562,19 @@ mod tests {
     fn renders_tool_help_with_parameter_list() {
         let help = render_tool_help(&sample_tool());
 
-        assert!(help.contains("Usage: omc sample"));
+        assert!(help.contains("Usage: omc sample [--<parameter> <value>]"));
         assert!(help.contains("--issueID <STRING>"));
         assert!(help.contains("--members <STRING>..."));
         assert!(help.contains("[required]"));
+    }
+
+    #[test]
+    fn renders_tool_help_without_parameter_placeholder_for_empty_schema() {
+        let help = render_tool_help(&no_parameter_tool());
+
+        assert!(help.contains("Usage: omc who_am_i\n"));
+        assert!(!help.contains("[--<parameter> <value>]"));
+        assert!(!help.contains("\nParameters:\n"));
     }
 
     #[test]

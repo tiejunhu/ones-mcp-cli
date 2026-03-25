@@ -80,7 +80,7 @@ Show the current configuration:
 omc config show
 ```
 
-Call a cached MCP tool by command name and pass tool arguments with `--<parameter> <value>`:
+Call a cached MCP tool by command name. Pass tool arguments with `--<parameter> <value>` only when the tool accepts parameters:
 
 ```bash
 omc who_am_i
