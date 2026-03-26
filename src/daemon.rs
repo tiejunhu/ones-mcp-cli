@@ -27,7 +27,7 @@ const DAEMON_RETRY_DELAY: Duration = Duration::from_millis(50);
 const TOOL_CACHE_READY_RETRIES: usize = 600;
 const TOOL_CACHE_RETRY_DELAY: Duration = Duration::from_millis(50);
 const TOOL_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(30 * 60);
-const DAEMON_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const DAEMON_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const TOOL_CACHE_FILE_NAME: &str = "tools.json";
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
