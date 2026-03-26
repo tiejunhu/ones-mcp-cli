@@ -149,14 +149,7 @@ fn root_help_appends_current_version_to_about() {
 }
 
 #[test]
-fn parses_hidden_daemon_foreground_subcommand() {
-    let cli = Cli::try_parse_from(["omc", "daemon", "run", "--foreground"])
-        .expect("expected daemon foreground to parse");
-    assert!(matches!(cli.command, Some(crate::Commands::Daemon(_))));
-}
-
-#[test]
-fn daemon_socket_override_is_available_for_background_run() {
+fn daemon_socket_override_is_available_for_run() {
     let cli = Cli::try_parse_from(["omc", "daemon", "--socket", "/tmp/ones-mcp-cli.sock", "run"])
         .expect("expected daemon run with socket");
 
@@ -172,6 +165,14 @@ fn daemon_run_accepts_top_level_url_override() {
         .expect("expected daemon run with top-level url override");
 
     assert_eq!(cli.url.as_deref(), Some("https://example.com"));
+}
+
+#[test]
+fn daemon_run_rejects_foreground_flag() {
+    let error = Cli::try_parse_from(["omc", "daemon", "run", "--foreground"])
+        .expect_err("expected daemon run foreground flag to be rejected");
+
+    assert!(format_clap_error(&error).contains("unexpected argument '--foreground'"));
 }
 
 #[test]
@@ -215,6 +216,15 @@ fn daemon_status_does_not_require_config_url() {
 }
 
 #[test]
+fn reload_requires_runtime_checks_and_config_url_but_not_daemon_ready() {
+    let cli = Cli::try_parse_from(["omc", "reload"]).expect("expected reload command");
+
+    assert!(command_requires_runtime_checks(cli.command.as_ref()));
+    assert!(command_requires_config_url(cli.command.as_ref()));
+    assert!(!command_requires_daemon_ready(cli.command.as_ref()));
+}
+
+#[test]
 fn tool_commands_require_runtime_checks_and_daemon() {
     let cli = Cli::try_parse_from(["omc", "who_am_i"]).expect("expected tool command");
     assert!(command_requires_runtime_checks(cli.command.as_ref()));
@@ -232,6 +242,12 @@ fn parses_hidden_daemon_status_subcommand() {
 fn parses_hidden_daemon_exit_subcommand() {
     let cli = Cli::try_parse_from(["omc", "daemon", "exit"]).expect("expected daemon exit");
     assert!(matches!(cli.command, Some(crate::Commands::Daemon(_))));
+}
+
+#[test]
+fn parses_reload_subcommand() {
+    let cli = Cli::try_parse_from(["omc", "reload"]).expect("expected reload");
+    assert!(matches!(cli.command, Some(crate::Commands::Reload)));
 }
 
 #[test]
@@ -338,6 +354,18 @@ fn does_not_rewrite_help_subcommand_for_builtin_commands() {
             OsString::from("omc"),
             OsString::from("help"),
             OsString::from("daemon"),
+        ]
+    );
+    assert_eq!(
+        rewrite_help_command_for_tool(&[
+            OsString::from("omc"),
+            OsString::from("help"),
+            OsString::from("reload"),
+        ]),
+        vec![
+            OsString::from("omc"),
+            OsString::from("help"),
+            OsString::from("reload"),
         ]
     );
 }

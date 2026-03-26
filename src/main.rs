@@ -39,6 +39,8 @@ struct Cli {
 enum Commands {
     /// Manage CLI configuration
     Config(ConfigCommand),
+    /// Refresh the cached tool list for the current URL
+    Reload,
     #[command(hide = true)]
     Daemon(DaemonCommand),
     #[command(external_subcommand)]
@@ -75,16 +77,9 @@ struct DaemonCommand {
 
 #[derive(Subcommand, Debug)]
 enum DaemonSubcommands {
-    Run(DaemonRunCommand),
+    Run,
     Status,
     Exit,
-}
-
-#[derive(Args, Debug)]
-struct DaemonRunCommand {
-    /// Run the daemon in the foreground
-    #[arg(long)]
-    foreground: bool,
 }
 
 #[derive(Serialize)]
@@ -182,7 +177,7 @@ fn help_tool_rewrite_indices(args: &[OsString]) -> Option<(usize, usize)> {
 }
 
 fn is_builtin_help_target(target: &str) -> bool {
-    matches!(target, "config" | "daemon" | "help")
+    matches!(target, "config" | "daemon" | "help" | "reload")
 }
 
 fn should_print_help(arg_count: usize) -> bool {
@@ -395,6 +390,18 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
 
     match cli.command {
         Some(Commands::Config(command)) => run_config_command(command, &config_path)?,
+        Some(Commands::Reload) => {
+            let url = effective_url
+                .as_deref()
+                .ok_or("configured url is required before reloading cached tools")?;
+            let status = daemon::reload_tool_cache(url, None).await?;
+            let state = if status.changed {
+                "updated"
+            } else {
+                "unchanged"
+            };
+            println!("tool cache {state} for {url} ({} tools)", status.tool_count);
+        }
         Some(Commands::Daemon(command)) => {
             run_daemon_command(
                 command,
@@ -434,18 +441,11 @@ async fn run_daemon_command(
     configured_url: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     match command.command {
-        DaemonSubcommands::Run(run) => {
+        DaemonSubcommands::Run => {
             let url = configured_url
                 .map(ToOwned::to_owned)
                 .ok_or_else(|| missing_url_error(config_path, config_override))?;
-            if run.foreground {
-                daemon::run_daemon(&url, command.socket.as_deref()).await?;
-            } else {
-                let status =
-                    daemon::ensure_daemon_running(&url, config_override, command.socket.as_deref())
-                        .await?;
-                println!("daemon ({status}) is running");
-            }
+            daemon::run_daemon(&url, command.socket.as_deref()).await?;
         }
         DaemonSubcommands::Status => {
             let status = daemon::request_status(configured_url, command.socket.as_deref()).await?;
@@ -471,8 +471,9 @@ fn command_requires_config_url(command: Option<&Commands>) -> bool {
     match command {
         None => true,
         Some(Commands::Config(_)) => false,
+        Some(Commands::Reload) => true,
         Some(Commands::Daemon(DaemonCommand {
-            command: DaemonSubcommands::Run(_),
+            command: DaemonSubcommands::Run,
             ..
         })) => true,
         Some(Commands::Daemon(_)) => false,
@@ -483,7 +484,7 @@ fn command_requires_config_url(command: Option<&Commands>) -> bool {
 fn command_requires_daemon_ready(command: Option<&Commands>) -> bool {
     !matches!(
         command,
-        Some(Commands::Config(_)) | Some(Commands::Daemon(_))
+        Some(Commands::Config(_)) | Some(Commands::Reload) | Some(Commands::Daemon(_))
     )
 }
 

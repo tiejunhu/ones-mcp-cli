@@ -621,7 +621,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CachedTool, display_tool_result, parameter_value_hint, parse_tool_arguments, render_tool_help,
+        CachedTool, display_tool_result, parameter_value_hint, parse_tool_arguments,
+        render_tool_help,
     };
 
     fn sample_tool() -> CachedTool {
@@ -771,10 +772,13 @@ mod tests {
         assert!(help.contains("[required]"));
         assert!(
             help.find("--issueID <STRING>").expect("issueID help line")
-                < help.find("--members <STRING>...").expect("members help line")
+                < help
+                    .find("--members <STRING>...")
+                    .expect("members help line")
         );
         assert!(
-            help.find("--members <STRING>...").expect("members help line")
+            help.find("--members <STRING>...")
+                .expect("members help line")
                 < help.find("--hours <NUMBER>").expect("hours help line")
         );
         assert!(
@@ -825,9 +829,7 @@ mod tests {
         assert!(help.contains(
             "                          dateValue: Optional date value in YYYY-MM-DD format for date fields.\n"
         ));
-        assert!(help.contains(
-            "                          value: Field value.\n"
-        ));
+        assert!(help.contains("                          value: Field value.\n"));
     }
 
     #[test]

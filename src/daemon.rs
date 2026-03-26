@@ -72,6 +72,12 @@ pub(crate) struct CachedToolSummary {
     pub(crate) description: Option<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ToolCacheReloadStatus {
+    pub(crate) changed: bool,
+    pub(crate) tool_count: usize,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub(crate) struct CachedTool {
     pub(crate) name: String,
@@ -230,7 +236,7 @@ pub(crate) fn spawn_detached_daemon(
         command.arg("--socket").arg(path);
     }
 
-    command.arg("run").arg("--foreground");
+    command.arg("run");
     command.stdin(Stdio::null());
     command.stdout(Stdio::null());
     command.stderr(Stdio::from(File::create(&startup_log_path)?));
@@ -340,6 +346,41 @@ pub(crate) async fn call_tool(
 
     let response = read_downstream_response_for_id(&mut reader, &request_id).await?;
     response_result(&response, "tools/call")
+}
+
+pub(crate) async fn reload_tool_cache(
+    url: &str,
+    socket_override: Option<&Path>,
+) -> Result<ToolCacheReloadStatus, Box<dyn Error>> {
+    let cache_path = tool_cache_path(url, socket_override)?;
+    let npm_cache_dir = cache_path
+        .parent()
+        .ok_or("failed to determine npm cache directory")?
+        .join("npm");
+    let mut child = spawn_remote(url, &npm_cache_dir)?;
+    let child_stdin = child
+        .stdin
+        .take()
+        .ok_or("mcp-remote stdin is no longer available")?;
+    let child_stdout = child
+        .stdout
+        .take()
+        .ok_or("mcp-remote stdout is no longer available")?;
+    let mut reader = BufReader::new(child_stdout);
+    let mut writer = child_stdin;
+    let mut daemon_request_counter = 0_u64;
+
+    initialize_upstream(&mut reader, &mut writer, &mut daemon_request_counter).await?;
+    let status = refresh_tool_cache_once(
+        url,
+        &cache_path,
+        &mut reader,
+        &mut writer,
+        &mut daemon_request_counter,
+    )
+    .await?;
+    finish_child(&mut child).await?;
+    Ok(status)
 }
 
 pub(crate) fn resolve_socket_path(
@@ -1142,7 +1183,7 @@ async fn refresh_tool_cache_once(
     reader: &mut BufReader<tokio::process::ChildStdout>,
     writer: &mut tokio::process::ChildStdin,
     daemon_request_counter: &mut u64,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<ToolCacheReloadStatus, Box<dyn Error>> {
     let mut tools = Vec::new();
     let mut cursor = None;
 
@@ -1159,8 +1200,12 @@ async fn refresh_tool_cache_once(
         }
     }
 
-    update_tool_cache(url, cache_path, tools)?;
-    Ok(())
+    let tool_count = tools.len();
+    let changed = update_tool_cache(url, cache_path, tools)?;
+    Ok(ToolCacheReloadStatus {
+        changed,
+        tool_count,
+    })
 }
 
 async fn handle_refresh_response<W>(
@@ -1350,7 +1395,7 @@ fn update_tool_cache(
     url: &str,
     cache_path: &Path,
     mut tools: Vec<Value>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<bool, Box<dyn Error>> {
     sort_tool_values(&mut tools);
     let tool_names = tools
         .iter()
@@ -1363,7 +1408,8 @@ fn update_tool_cache(
         tools,
     };
 
-    match write_tool_cache_if_changed(cache_path, &cache)? {
+    let changed = write_tool_cache_if_changed(cache_path, &cache)?;
+    match changed {
         true => eprintln!(
             "updated tool cache {} with tools: {}",
             cache_path.display(),
@@ -1376,7 +1422,7 @@ fn update_tool_cache(
         ),
     }
 
-    Ok(())
+    Ok(changed)
 }
 
 async fn send_tools_list_request<W>(
